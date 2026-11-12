@@ -1,413 +1,377 @@
 
-name: Build APK & Register Device Serial
+name: Build Android APK
 
 on:
   workflow_dispatch:
     inputs:
-      device_serial:
-        description: 'Nomor seri HP (opsional)'
-        required: false
-        type: string
       project_zip:
-        description: 'Nama ZIP source (kosong = otomatis)'
+        description: "Nama/path ZIP project (kosong = deteksi otomatis)"
         required: false
         type: string
-
   push:
-    branches: [main, master]
-
-  repository_dispatch:
-    types: [register_device]
+    branches:
+      - main
+      - master
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-register:
+  build:
+    name: Detect Project and Build APK
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout
-      - name: Checkout repository
+      # 1. Ambil source repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # 2. Java 17
-      - name: Set up Java 17
+      # 2. Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      # 3. Android SDK
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        run: |
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-          yes | sdkmanager --licenses
-
-      # 4. Gradle
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      # 5. AUTO DETECT ZIP / PROJECT
-      - name: Detect and extract Android project
-        id: detect
+      # 3. Deteksi ZIP atau source langsung
+      - name: Detect and Extract Android Project
+        id: project
+        shell: bash
         env:
-          ZIP_INPUT: ${{ github.event.inputs.project_zip }}
+          PROJECT_ZIP: ${{ inputs.project_zip }}
         run: |
-          set -e
-
-          python3 - <<'PY'
-          import os, sys, zipfile, shutil, re
+          python3 <<'PY'
+          import os
+          import sys
+          import zipfile
           from pathlib import Path, PurePosixPath
 
-          workspace = Path(os.environ["GITHUB_WORKSPACE"])
-          extract = workspace / "_android_source"
-          extract.mkdir(exist_ok=True)
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          extract_dir = workspace / "_android_source"
+          requested_zip = os.environ.get("PROJECT_ZIP", "").strip()
 
-          requested = os.environ.get("ZIP_INPUT", "").strip()
+          ignored = {
+              ".git", ".gradle", ".idea", "build",
+              "node_modules", "__pycache__", "_android_source"
+          }
 
-          # Find ZIP files in repository root
-          zips = sorted(
-              p for p in workspace.glob("*.zip")
-              if p.is_file()
-          )
+          def valid_project(folder):
+              settings = any(
+                  (folder / name).is_file()
+                  for name in (
+                      "settings.gradle",
+                      "settings.gradle.kts"
+                  )
+              )
+
+              app_build = any(
+                  (folder / "app" / name).is_file()
+                  for name in (
+                      "build.gradle",
+                      "build.gradle.kts"
+                  )
+              )
+
+              return settings and app_build
+
+          def find_projects(root):
+              found = []
+
+              for current, dirs, files in os.walk(root):
+                  dirs[:] = [
+                      d for d in dirs
+                      if d not in ignored and not d.startswith(".")
+                  ]
+
+                  folder = Path(current)
+
+                  if valid_project(folder):
+                      found.append(folder)
+
+              return found
 
           selected_zip = None
 
-          if requested:
-              candidate = workspace / requested
-              if not candidate.is_file() or candidate.suffix.lower() != ".zip":
-                  sys.exit(f"ZIP tidak ditemukan: {requested}")
+          if requested_zip:
+              candidate = (workspace / requested_zip).resolve()
+
+              if workspace not in candidate.parents or not candidate.is_file():
+                  raise SystemExit(
+                      "ZIP tidak ditemukan atau path ZIP tidak valid: "
+                      + requested_zip
+                  )
+
+              if candidate.suffix.lower() != ".zip":
+                  raise SystemExit("File yang dipilih bukan ZIP.")
+
               selected_zip = candidate
 
-          elif len(zips) == 1:
-              selected_zip = zips[0]
-
-          elif len(zips) > 1:
-              sys.exit(
-                  "Ditemukan beberapa ZIP. Isi input project_zip "
-                  "dengan nama ZIP yang ingin dibuild."
+          else:
+              root_zips = sorted(
+                  p for p in workspace.iterdir()
+                  if p.is_file() and p.suffix.lower() == ".zip"
               )
 
+              if len(root_zips) == 1:
+                  selected_zip = root_zips[0]
+
+              elif len(root_zips) > 1:
+                  raise SystemExit(
+                      "Ditemukan beberapa ZIP. Isi input project_zip "
+                      "dengan nama ZIP yang ingin digunakan."
+                  )
+
           if selected_zip:
-              print(f"ZIP SOURCE: {selected_zip.name}")
+              print("Mode: ZIP")
+              print("ZIP:", selected_zip.name)
 
-              # Safe extraction: reject path traversal and symlinks
-              with zipfile.ZipFile(selected_zip) as z:
-                  for item in z.infolist():
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              with zipfile.ZipFile(selected_zip) as archive:
+                  for item in archive.infolist():
                       name = item.filename.replace("\\", "/")
-                      path = PurePosixPath(name)
+                      relative = PurePosixPath(name)
 
-                      if path.is_absolute() or ".." in path.parts:
-                          sys.exit(f"ZIP tidak aman: {name}")
+                      if relative.is_absolute() or ".." in relative.parts:
+                          raise SystemExit(
+                              "ZIP ditolak karena memiliki path tidak aman: "
+                              + name
+                          )
 
-                      if item.external_attr >> 28 == 0xA:
-                          sys.exit(f"Symlink tidak diizinkan: {name}")
+                      unix_mode = (item.external_attr >> 16) & 0o170000
 
-                  z.extractall(extract)
+                      if unix_mode == 0o120000:
+                          raise SystemExit(
+                              "ZIP ditolak karena mengandung symbolic link."
+                          )
 
+                      destination = (extract_dir / Path(*relative.parts)).resolve()
+
+                      if destination != extract_dir and extract_dir not in destination.parents:
+                          raise SystemExit("Path ZIP keluar dari folder ekstraksi.")
+
+                      if item.is_dir():
+                          destination.mkdir(parents=True, exist_ok=True)
+                      else:
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+
+                          with archive.open(item) as source:
+                              with open(destination, "wb") as target:
+                                  while True:
+                                      chunk = source.read(1024 * 1024)
+                                      if not chunk:
+                                          break
+                                      target.write(chunk)
+
+              search_root = extract_dir
               artifact_base = selected_zip.stem
 
           else:
-              print("SOURCE: Direct repository")
-              extract = workspace
-              artifact_base = workspace.name
+              print("Mode: SOURCE LANGSUNG")
+              search_root = workspace
+              artifact_base = None
 
-          # Locate valid Gradle Android projects.
-          # Supports Groovy and Kotlin DSL.
-          candidates = []
+          projects = find_projects(search_root)
 
-          for settings in (
-              list(extract.rglob("settings.gradle.kts")) +
-              list(extract.rglob("settings.gradle")) +
-              list(extract.rglob("settings.gradle.dcl"))
-          ):
-              project = settings.parent
-              app = project / "app"
-
-              app_gradle = [
-                  app / "build.gradle.kts",
-                  app / "build.gradle",
-                  app / "build.gradle.dcl"
-              ]
-
-              if not any(p.is_file() for p in app_gradle):
-                  continue
-
-              # Ignore generated or hidden directories
-              relative = project.relative_to(extract)
-              if any(
-                  part.startswith(".") or
-                  part in {"build", ".gradle", "node_modules"}
-                  for part in relative.parts
-              ):
-                  continue
-
-              candidates.append(project)
-
-          if not candidates:
-              sys.exit(
-                  "Tidak menemukan Android Gradle project. "
-                  "Diperlukan settings.gradle(.kts) dan "
-                  "app/build.gradle(.kts)."
+          if not projects:
+              raise SystemExit(
+                  "Project Android tidak ditemukan. Pastikan terdapat "
+                  "settings.gradle(.kts) dan app/build.gradle(.kts)."
               )
 
-          # Prefer outermost project root.
-          candidates.sort(key=lambda p: (len(p.parts), str(p)))
+          projects.sort(key=lambda p: (len(p.parts), str(p)))
 
-          shortest = len(candidates[0].parts)
-          best = [p for p in candidates if len(p.parts) == shortest]
+          shallowest = len(projects[0].parts)
+          matches = [p for p in projects if len(p.parts) == shallowest]
 
-          if len(best) > 1:
-              print("Beberapa project ditemukan:")
-              for p in best:
+          if len(matches) > 1:
+              print("Beberapa project Android ditemukan:")
+              for p in matches:
                   print(" -", p)
-              sys.exit(
-                  "Project ambigu. Sisakan satu project utama "
-                  "atau rapikan struktur ZIP."
+              raise SystemExit(
+                  "Project ambigu. Sisakan satu project atau atur isi ZIP."
               )
 
-          project = best[0].resolve()
+          project = matches[0]
 
-          # Validate root files and report optional files.
-          required = [
-              project / "settings.gradle.kts",
-              project / "settings.gradle",
-          ]
+          if artifact_base is None:
+              artifact_base = project.name
 
-          print("\n=== PROJECT UTAMA ===")
-          print(project)
+          artifact_base = "".join(
+              c if c.isalnum() or c in "-_." else "-"
+              for c in artifact_base
+          ).strip("-.")
 
-          for name in [
-              "settings.gradle.kts",
-              "settings.gradle",
-              "build.gradle.kts",
-              "build.gradle",
-              "gradle.properties",
-          ]:
-              print(f"{name}: {'ADA' if (project/name).is_file() else 'TIDAK ADA'}")
+          if not artifact_base:
+              artifact_base = "android-project"
 
-          app = project / "app"
-          for name in ["build.gradle.kts", "build.gradle"]:
-              if (app/name).is_file():
-                  print(f"app/{name}: ADA")
+          relative_project = project.relative_to(workspace)
 
-          # Save GitHub outputs
-          artifact = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact_base).strip("-")
-          if not artifact:
-              artifact = "AndroidProject"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"project_dir={relative_project}\n")
+              output.write(f"artifact_base={artifact_base}\n")
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"PROJECT_DIR={project}\n")
-              f.write(f"ARTIFACT_BASE={artifact}\n")
-              f.write(f"SOURCE_MODE={'zip' if selected_zip else 'direct'}\n")
-
-          print("\nPROJECT DETECTED SUCCESSFULLY")
-          print("ARTIFACT:", artifact)
+          print("Project ditemukan:", project)
+          print("Nama artifact:", artifact_base)
           PY
 
-      # 6. Inspect Android Gradle configuration
-      - name: Inspect project configuration
-        working-directory: ${{ steps.detect.outputs.PROJECT_DIR }}
+      # 4. Siapkan Android SDK tanpa setup-android
+      - name: Setup Android SDK
+        id: android_sdk
+        shell: bash
         run: |
-          echo "=== ROOT PROJECT ==="
-          pwd
+          set -euo pipefail
+
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+          mkdir -p "$ANDROID_HOME"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null \
+            | sort -V | tail -n 1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan di Android SDK."
+            echo "Periksa instalasi Android Command-line Tools runner."
+            exit 1
+          fi
+
+          echo "Menggunakan sdkmanager: $SDKMANAGER"
+
+          # Terima lisensi tanpa memasang paket SDK bernama 'tools'
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          # Deteksi compileSdk dan buildToolsVersion project
+          PROJECT_DIR="${{ steps.project.outputs.project_dir }}"
+
+          python3 - "$PROJECT_DIR" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          project = Path(sys.argv[1])
+          files = [
+              project / "app" / "build.gradle",
+              project / "app" / "build.gradle.kts",
+          ]
+
+          compile_sdk = 35
+          build_tools = "35.0.0"
+
+          for file in files:
+              if not file.is_file():
+                  continue
+
+              content = file.read_text(errors="ignore")
+
+              match = re.search(
+                  r'compileSdk(?:Version)?\s*(?:=|\()\s*(\d+)',
+                  content
+              )
+
+              if match:
+                  compile_sdk = int(match.group(1))
+
+              match = re.search(
+                  r'buildToolsVersion\s*(?:=)?\s*["\']([^"\']+)',
+                  content
+              )
+
+              if match:
+                  build_tools = match.group(1)
+
+              break
+
+          print(f"compileSdk={compile_sdk}")
+          print(f"buildToolsVersion={build_tools}")
+
+          with open("sdk_config.env", "w") as f:
+              f.write(f"COMPILE_SDK={compile_sdk}\n")
+              f.write(f"BUILD_TOOLS={build_tools}\n")
+          PY
+
+          source sdk_config.env
+
+          echo "Memasang SDK yang diperlukan..."
+
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS}"
+
+          echo "SDK berhasil disiapkan."
+
+      # 5. Siapkan Gradle
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      # 6. Build APK debug
+      - name: Build Debug APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "Project directory: $(pwd)"
+          echo "Memeriksa file Gradle..."
+
           ls -la
 
-          echo "=== APP MODULE ==="
-          ls -la app
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            GRADLE="./gradlew"
+          else
+            GRADLE="gradle"
+          fi
 
-          echo "=== GRADLE FILES ==="
-          find . -maxdepth 3 \
-            \( -name "build.gradle" \
-            -o -name "build.gradle.kts" \
-            -o -name "settings.gradle" \
-            -o -name "settings.gradle.kts" \
-            -o -name "gradle.properties" \) \
-            -type f -print
+          echo "Memulai build APK..."
 
-      # 7. AUTO DETECT KEYSTORE
-      - name: Auto-detect keystore
-        id: keystore
+          "$GRADLE" \
+            --no-daemon \
+            --stacktrace \
+            assembleDebug
+
+          echo "Build APK selesai."
+
+      # 7. Pastikan APK tersedia
+      - name: Check APK
+        id: apk
+        shell: bash
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          PROJECT_DIR: ${{ steps.detect.outputs.PROJECT_DIR }}
+          PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
         run: |
-          set -e
+          set -euo pipefail
 
-          DEST="$GITHUB_WORKSPACE/_keystore"
-          mkdir -p "$DEST"
+          APK_DIR="$PROJECT_DIR/app/build/outputs/apk/debug"
 
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$DEST/myx.jks"
-            if [ -s "$DEST/myx.jks" ]; then
-              echo "HAS_KEYSTORE=true" >> "$GITHUB_OUTPUT"
-              echo "KEYSTORE_PATH=$DEST/myx.jks" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::Folder APK debug tidak ditemukan."
+            exit 1
           fi
 
-          KEY=$(find "$PROJECT_DIR/keystore" \
-            -maxdepth 1 -type f -name "*.jks" 2>/dev/null | head -n1 || true)
+          find "$APK_DIR" -type f -name "*.apk" -print
 
-          if [ -z "$KEY" ]; then
-            KEY=$(find "$PROJECT_DIR" \
-              -maxdepth 1 -type f -name "*.jks" | head -n1 || true)
+          if ! find "$APK_DIR" -type f -name "*.apk" -print -quit | grep -q .; then
+            echo "::error::APK tidak berhasil dibuat."
+            exit 1
           fi
 
-          if [ -z "$KEY" ]; then
-            KEY=$(find "$GITHUB_WORKSPACE" \
-              -maxdepth 3 -type f -name "*.jks" \
-              ! -path "*/_keystore/*" | head -n1 || true)
-          fi
+          echo "APK siap diunggah."
 
-          if [ -n "$KEY" ]; then
-            echo "HAS_KEYSTORE=true" >> "$GITHUB_OUTPUT"
-            echo "KEYSTORE_PATH=$KEY" >> "$GITHUB_OUTPUT"
-          else
-            echo "HAS_KEYSTORE=false" >> "$GITHUB_OUTPUT"
-            echo "Tidak ada keystore."
-          fi
-
-      # 8. Build DEBUG
-      - name: Build Debug APK
-        working-directory: ${{ steps.detect.outputs.PROJECT_DIR }}
-        run: |
-          set -e
-
-          if [ -f gradlew ]; then
-            chmod +x gradlew
-            ./gradlew --no-daemon assembleDebug
-          else
-            gradle --no-daemon assembleDebug
-          fi
-
-      # 9. Build RELEASE
-      # Requires the project's release signingConfig to use
-      # KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD.
-      - name: Build Release APK
-        if: ${{ steps.keystore.outputs.HAS_KEYSTORE == 'true' }}
-        working-directory: ${{ steps.detect.outputs.PROJECT_DIR }}
-        env:
-          KEYSTORE_FILE: ${{ steps.keystore.outputs.KEYSTORE_PATH }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -e
-
-          if [ -f gradlew ]; then
-            ./gradlew --no-daemon assembleRelease
-          else
-            gradle --no-daemon assembleRelease
-          fi
-
-      # 10. Upload DEBUG
+      # 8. Upload APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.detect.outputs.ARTIFACT_BASE }}-debug-apk
-          path: ${{ steps.detect.outputs.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          name: ${{ steps.project.outputs.artifact_base }}-debug-apk
+          path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/**/*.apk
           if-no-files-found: error
           retention-days: 30
-
-      # 11. Upload RELEASE
-      - name: Upload Release APK
-        if: ${{ steps.keystore.outputs.HAS_KEYSTORE == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.detect.outputs.ARTIFACT_BASE }}-release-apk
-          path: ${{ steps.detect.outputs.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-          retention-days: 30
-
-      # 12. REGISTER DEVICE SERIAL
-      - name: Register device serial
-        if: ${{ github.event.inputs.device_serial != '' || github.event.client_payload.device_serial != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SERIAL: ${{ github.event.inputs.device_serial || github.event.client_payload.device_serial }}
-        run: |
-          set -e
-
-          python3 - <<'PY'
-          import os, json, urllib.request, urllib.error, base64
-
-          token = os.environ["GH_TOKEN"]
-          repo = os.environ["REPO"]
-          serial = os.environ["SERIAL"].strip()
-
-          if not serial:
-              raise SystemExit("Serial kosong")
-
-          path = "device_serials.json"
-          api = f"https://api.github.com/repos/{repo}/contents/{path}"
-
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28"
-          }
-
-          req = urllib.request.Request(api, headers=headers)
-
-          try:
-              with urllib.request.urlopen(req) as response:
-                  remote = json.loads(response.read())
-                  sha = remote["sha"]
-                  data = json.loads(base64.b64decode(remote["content"]))
-          except urllib.error.HTTPError as e:
-              if e.code == 404:
-                  sha = None
-                  data = {"serials": []}
-              else:
-                  raise
-
-          data.setdefault("serials", [])
-
-          if serial not in data["serials"]:
-              data["serials"].append(serial)
-          else:
-              print("Serial sudah terdaftar.")
-
-          payload = {
-              "message": "Register device serial",
-              "content": base64.b64encode(
-                  json.dumps(data, indent=2).encode()
-              ).decode()
-          }
-
-          if sha:
-              payload["sha"] = sha
-
-          request = urllib.request.Request(
-              api,
-              data=json.dumps(payload).encode(),
-              headers=headers,
-              method="PUT"
-          )
-
-          with urllib.request.urlopen(request) as response:
-              print("Registration status:", response.status)
-          PY
-
-      # 13. CREATE RELEASE
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') && steps.keystore.outputs.HAS_KEYSTORE == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.detect.outputs.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
