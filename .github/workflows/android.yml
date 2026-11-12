@@ -37,8 +37,15 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      
       - name: Build APK
-        run: gradle --no-daemon assembleDebug
+        run: |
+          echo "Checking project structure..."
+          ls -la
+          find . -name settings.gradle.kts
+
+          cd SignalBoosterProCyberX
+          gradle --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
